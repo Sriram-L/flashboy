@@ -1,10 +1,12 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap,
+};
 use ratatui::Frame;
 
-use crate::app::{App, EditFocus, Screen};
+use crate::app::{App, DetailPane, EditFocus, Screen};
 use crate::store::{self, Verdict};
 use crate::theme;
 
@@ -158,22 +160,94 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("│");
+    app.rects.list = body[0];
     frame.render_stateful_widget(list, body[0], &mut app.list_state);
 
-    frame.render_widget(detail_widget(app), body[1]);
+    draw_detail_panes(frame, app, body[1]);
 
     let hint = if app.busy {
-        "running… keys locked"
+        "running…  PgUp/PgDn or wheel to scroll"
     } else {
-        "n new  e edit  d delete  r run  R all  J/K scroll  ? help  q quit"
+        "n new  e edit  d del  r run  R all  tab pane  PgUp/PgDn/wheel scroll  ? help  q quit"
     };
     frame.render_widget(footer(hint), chunks[2]);
 }
 
-fn detail_widget(app: &App) -> Paragraph<'static> {
+fn draw_detail_panes(frame: &mut Frame, app: &mut App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+
+    app.rects.input = cols[1];
+    app.rects.expected = cols[2];
+    app.rects.output = cols[3];
+
+    frame.render_widget(header_widget(app), cols[0]);
+
+    let (input_text, expected_text, output_text) = pane_texts(app);
+    let input_lines = numbered_lines(&input_text);
+    let expected_lines = match expected_text.as_deref() {
+        None => vec![Line::from(Span::styled(
+            "  (none — output only)",
+            theme::muted(),
+        ))],
+        Some("") => numbered_lines(""),
+        Some(s) => numbered_lines(s),
+    };
+    let output_lines = output_text;
+
+    let inner_w = |r: Rect| r.width.saturating_sub(2).max(1);
+    app.pane_lines[0] = visual_rows(&input_lines, inner_w(cols[1]));
+    app.pane_lines[1] = visual_rows(&expected_lines, inner_w(cols[2]));
+    app.pane_lines[2] = visual_rows(&output_lines, inner_w(cols[3]));
+    for i in 0..3 {
+        let view = match i {
+            0 => cols[1].height.saturating_sub(2).max(1),
+            1 => cols[2].height.saturating_sub(2).max(1),
+            _ => cols[3].height.saturating_sub(2).max(1),
+        };
+        let max = app.pane_lines[i].saturating_sub(view);
+        if app.pane_scroll[i] > max {
+            app.pane_scroll[i] = max;
+        }
+    }
+
+    render_scroll_pane(
+        frame,
+        cols[1],
+        "input  (stdin)",
+        app.detail_pane == DetailPane::Input,
+        app.pane_scroll[0],
+        input_lines,
+    );
+    render_scroll_pane(
+        frame,
+        cols[2],
+        "expected",
+        app.detail_pane == DetailPane::Expected,
+        app.pane_scroll[1],
+        expected_lines,
+    );
+    render_scroll_pane(
+        frame,
+        cols[3],
+        "output",
+        app.detail_pane == DetailPane::Output,
+        app.pane_scroll[2],
+        output_lines,
+    );
+}
+
+fn header_widget(app: &App) -> Paragraph<'static> {
     let Some(c) = app.selected_case() else {
         return Paragraph::new(Span::styled(
-            "\n  no case selected — press n to add one",
+            "  no case selected — press n to add one",
             theme::muted(),
         ))
         .block(outer("detail"));
@@ -185,7 +259,6 @@ fn detail_widget(app: &App) -> Paragraph<'static> {
         Span::styled(c.name.clone(), theme::title()),
         Span::styled(format!("  #{}", c.id), theme::muted()),
     ]));
-
     if let Some(r) = &c.last {
         let vstyle = match r.verdict {
             Verdict::Pass => theme::pass(),
@@ -207,75 +280,88 @@ fn detail_widget(app: &App) -> Paragraph<'static> {
             ),
             Span::styled(extra, theme::tle()),
         ]));
-        if let Some(code) = r.exit_code {
-            lines.push(Line::from(Span::styled(
-                format!("  exit     {code}"),
-                theme::muted(),
-            )));
-        }
     } else {
-        lines.push(Line::from(Span::styled(
-            "  not run yet",
-            theme::muted(),
-        )));
+        lines.push(Line::from(Span::styled("  not run yet", theme::muted())));
     }
+    Paragraph::new(lines).block(outer("detail"))
+}
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("  INPUT", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))));
-    push_body(&mut lines, &c.input);
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("  EXPECTED", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))));
-    match &c.expected {
-        Some(e) => push_body(&mut lines, e),
-        None => lines.push(Line::from(Span::styled("  (none — output only)", theme::muted()))),
-    }
-
+fn pane_texts(app: &App) -> (String, Option<String>, Vec<Line<'static>>) {
+    let Some(c) = app.selected_case() else {
+        return (
+            String::new(),
+            None,
+            vec![Line::from(Span::styled("  —", theme::muted()))],
+        );
+    };
+    let mut out: Vec<Line> = Vec::new();
     if let Some(r) = &c.last {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("  OUTPUT", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))));
         if r.verdict == Verdict::Tle {
-            lines.push(Line::from(Span::styled(
+            out.push(Line::from(Span::styled(
                 "  program killed after 5s (TLE)",
                 theme::tle(),
             )));
         } else {
-            push_body(&mut lines, &r.stdout);
+            out.extend(numbered_lines(&r.stdout));
         }
         if !r.stderr.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("  STDERR", theme::fail())));
-            push_body(&mut lines, &r.stderr);
+            out.push(Line::from(""));
+            out.push(Line::from(Span::styled("  STDERR", theme::fail())));
+            out.extend(numbered_lines(&r.stderr));
         }
         if r.verdict == Verdict::Fail {
             if let Some(exp) = &c.expected {
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("  DIFF", theme::fail())));
-                push_diff(&mut lines, exp, &r.stdout);
+                out.push(Line::from(""));
+                out.push(Line::from(Span::styled("  DIFF", theme::fail())));
+                push_diff(&mut out, exp, &r.stdout);
             }
         }
+    } else {
+        out.push(Line::from(Span::styled("  not run yet", theme::muted())));
     }
-
-    Paragraph::new(lines)
-        .block(outer("detail"))
-        .scroll((app.detail_scroll, 0))
-        .wrap(Wrap { trim: false })
+    (c.input.clone(), c.expected.clone(), out)
 }
 
-fn push_body(lines: &mut Vec<Line>, s: &str) {
+fn render_scroll_pane(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    active: bool,
+    scroll: u16,
+    lines: Vec<Line<'static>>,
+) {
+    let para = Paragraph::new(lines)
+        .block(field(title, active))
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+}
+
+fn numbered_lines(s: &str) -> Vec<Line<'static>> {
     if s.is_empty() {
-        lines.push(Line::from(Span::styled("  ∅", theme::muted())));
-        return;
+        return vec![Line::from(Span::styled("  ∅", theme::muted()))];
     }
-    for (i, line) in s.lines().take(200).enumerate() {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {:>3} │ ", i + 1), theme::muted()),
-            Span::raw(line.to_string()),
-        ]));
-    }
-    if s.lines().count() > 200 {
-        lines.push(Line::from(Span::styled("  … truncated", theme::muted())));
-    }
+    s.lines()
+        .enumerate()
+        .map(|(i, line)| {
+            Line::from(vec![
+                Span::styled(format!("  {:>4} │ ", i + 1), theme::muted()),
+                Span::raw(line.to_string()),
+            ])
+        })
+        .collect()
+}
+
+fn visual_rows(lines: &[Line], width: u16) -> u16 {
+    let w = width.max(1) as usize;
+    lines
+        .iter()
+        .map(|l| {
+            let n = l.width().max(1);
+            n.div_ceil(w)
+        })
+        .sum::<usize>()
+        .max(1) as u16
 }
 
 fn push_diff(lines: &mut Vec<Line>, expected: &str, actual: &str) {
@@ -283,7 +369,7 @@ fn push_diff(lines: &mut Vec<Line>, expected: &str, actual: &str) {
     let a = crate::runner::normalize(actual);
     let el: Vec<&str> = e.lines().collect();
     let al: Vec<&str> = a.lines().collect();
-    let n = el.len().max(al.len()).min(80);
+    let n = el.len().max(al.len());
     for i in 0..n {
         let left = el.get(i).copied().unwrap_or("");
         let right = al.get(i).copied().unwrap_or("");
@@ -308,9 +394,6 @@ fn draw_edit(frame: &mut Frame, app: &mut App) {
     frame.render_widget(block, area);
 
     let inner = inset(area);
-    let Some(edit) = app.edit.as_mut() else {
-        return;
-    };
     let cols = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -319,18 +402,26 @@ fn draw_edit(frame: &mut Frame, app: &mut App) {
             Constraint::Percentage(52),
         ])
         .split(inner);
+    app.rects.edit_input = cols[1];
+    app.rects.edit_expected = cols[2];
+
+    let Some(edit) = app.edit.as_mut() else {
+        return;
+    };
 
     let name_active = matches!(edit.focus, EditFocus::Name);
     let name = Paragraph::new(format!(" {}", edit.name)).block(field("name", name_active));
     frame.render_widget(name, cols[0]);
 
     let input_active = matches!(edit.focus, EditFocus::Input);
-    edit.input.set_block(field("input (stdin)", input_active));
+    edit.input.set_block(field("input (stdin)  ·  PgUp/PgDn / wheel", input_active));
+    app.rects.edit_input = cols[1];
     frame.render_widget(&edit.input, cols[1]);
 
     let exp_active = matches!(edit.focus, EditFocus::Expected);
     edit.expected
-        .set_block(field("expected (optional)", exp_active));
+        .set_block(field("expected (optional)  ·  PgUp/PgDn / wheel", exp_active));
+    app.rects.edit_expected = cols[2];
     frame.render_widget(&edit.expected, cols[2]);
 }
 
@@ -361,8 +452,11 @@ fn draw_help(frame: &mut Frame) {
             Line::from("  d          delete case"),
             Line::from("  r          run selected"),
             Line::from("  R / a      run all (compile once)"),
-            Line::from("  j / k      move"),
-            Line::from("  J / K      scroll detail"),
+            Line::from("  j / k      move cases"),
+            Line::from("  tab        focus input / expected / output"),
+            Line::from("  PgUp/PgDn  scroll focused pane"),
+            Line::from("  J / K      scroll one line"),
+            Line::from("  wheel      scroll pane under cursor"),
             Line::from("  esc        back to picker"),
             Line::from("  q          quit (auto-saves)"),
             Line::from(""),

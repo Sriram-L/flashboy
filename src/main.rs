@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -43,10 +43,10 @@ fn loop_ui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         app.drain_worker();
         terminal.draw(|f| ui::draw(f, app))?;
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == event::KeyEventKind::Press {
-                    app.on_key(key);
-                }
+            match event::read()? {
+                Event::Key(key) if key.kind == event::KeyEventKind::Press => app.on_key(key),
+                Event::Mouse(mouse) => app.on_mouse(mouse),
+                _ => {}
             }
         }
     }
@@ -55,7 +55,7 @@ fn loop_ui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
 
 fn setup() -> Result<()> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     std::panic::set_hook(Box::new(|info| {
         let _ = restore();
         eprintln!("{info}");
@@ -65,7 +65,7 @@ fn setup() -> Result<()> {
 
 fn restore() -> Result<()> {
     let _ = disable_raw_mode();
-    execute!(stdout(), LeaveAlternateScreen)?;
+    execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
     Ok(())
 }
 

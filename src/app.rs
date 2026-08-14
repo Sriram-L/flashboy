@@ -4,7 +4,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use tui_textarea::{Input, Key, TextArea};
 
@@ -24,6 +27,68 @@ pub enum EditFocus {
     Name,
     Input,
     Expected,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DetailPane {
+    Input,
+    Expected,
+    Output,
+}
+
+impl DetailPane {
+    fn idx(self) -> usize {
+        match self {
+            Self::Input => 0,
+            Self::Expected => 1,
+            Self::Output => 2,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Input => Self::Expected,
+            Self::Expected => Self::Output,
+            Self::Output => Self::Input,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::Input => Self::Output,
+            Self::Expected => Self::Input,
+            Self::Output => Self::Expected,
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct PaneRects {
+    pub list: Rect,
+    pub input: Rect,
+    pub expected: Rect,
+    pub output: Rect,
+    pub edit_input: Rect,
+    pub edit_expected: Rect,
+}
+
+impl PaneRects {
+    pub fn pane_at(&self, col: u16, row: u16) -> Option<DetailPane> {
+        let p = ratatui::layout::Position { x: col, y: row };
+        if self.input.contains(p) {
+            Some(DetailPane::Input)
+        } else if self.expected.contains(p) {
+            Some(DetailPane::Expected)
+        } else if self.output.contains(p) {
+            Some(DetailPane::Output)
+        } else {
+            None
+        }
+    }
+
+    fn view_h(rect: Rect) -> u16 {
+        rect.height.saturating_sub(2).max(1)
+    }
 }
 
 pub struct EditState {
@@ -51,7 +116,10 @@ pub struct App {
     pub bank_path: Option<PathBuf>,
     pub bank: Bank,
     pub list_state: ListState,
-    pub detail_scroll: u16,
+    pub detail_pane: DetailPane,
+    pub pane_scroll: [u16; 3],
+    pub pane_lines: [u16; 3],
+    pub rects: PaneRects,
     pub status: String,
     pub message: String,
     pub busy: bool,
@@ -75,7 +143,10 @@ impl App {
             bank_path: None,
             bank: Bank::new("program.cpp"),
             list_state: ListState::default(),
-            detail_scroll: 0,
+            detail_pane: DetailPane::Input,
+            pane_scroll: [0; 3],
+            pane_lines: [0; 3],
+            rects: PaneRects::default(),
             status: format!("TLE {TLE_SECS}s · g++-12 · postcard+zstd .fbk"),
             message: String::new(),
             busy: false,
@@ -106,7 +177,7 @@ impl App {
         if !self.bank.cases.is_empty() {
             self.list_state.select(Some(0));
         }
-        self.detail_scroll = 0;
+        self.reset_pane_scroll();
         self.screen = Screen::Main;
         self.status = format!(
             "{}  ·  {} cases  ·  {}",
@@ -144,6 +215,9 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        if matches!(self.screen, Screen::Main) && self.handle_scroll_key(key) {
+            return;
+        }
         if self.busy && !matches!(self.screen, Screen::Edit) {
             if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 self.should_quit = true;
@@ -163,6 +237,136 @@ impl App {
                 };
             }
         }
+    }
+
+    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        match self.screen {
+            Screen::Main => match mouse.kind {
+                MouseEventKind::ScrollDown => {
+                    if let Some(pane) = self.rects.pane_at(mouse.column, mouse.row) {
+                        self.detail_pane = pane;
+                        self.scroll_pane(pane, 3);
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if let Some(pane) = self.rects.pane_at(mouse.column, mouse.row) {
+                        self.detail_pane = pane;
+                        self.scroll_pane(pane, -3);
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(pane) = self.rects.pane_at(mouse.column, mouse.row) {
+                        self.detail_pane = pane;
+                    }
+                }
+                _ => {}
+            },
+            Screen::Edit => {
+                let pos = ratatui::layout::Position {
+                    x: mouse.column,
+                    y: mouse.row,
+                };
+                if let Some(edit) = self.edit.as_mut() {
+                    let target = if self.rects.edit_input.contains(pos) {
+                        edit.focus = EditFocus::Input;
+                        Some(&mut edit.input)
+                    } else if self.rects.edit_expected.contains(pos) {
+                        edit.focus = EditFocus::Expected;
+                        Some(&mut edit.expected)
+                    } else {
+                        None
+                    };
+                    if let Some(area) = target {
+                        let key = match mouse.kind {
+                            MouseEventKind::ScrollDown => Key::MouseScrollDown,
+                            MouseEventKind::ScrollUp => Key::MouseScrollUp,
+                            _ => return,
+                        };
+                        area.input(Input {
+                            key,
+                            ctrl: false,
+                            alt: false,
+                            shift: false,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_scroll_key(&mut self, key: KeyEvent) -> bool {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Tab => {
+                self.detail_pane = if shift {
+                    self.detail_pane.prev()
+                } else {
+                    self.detail_pane.next()
+                };
+                true
+            }
+            KeyCode::PageDown => {
+                self.scroll_pane(self.detail_pane, self.page_step());
+                true
+            }
+            KeyCode::PageUp => {
+                self.scroll_pane(self.detail_pane, -self.page_step());
+                true
+            }
+            KeyCode::Down if shift => {
+                self.scroll_pane(self.detail_pane, 1);
+                true
+            }
+            KeyCode::Up if shift => {
+                self.scroll_pane(self.detail_pane, -1);
+                true
+            }
+            KeyCode::Char('J') => {
+                self.scroll_pane(self.detail_pane, 1);
+                true
+            }
+            KeyCode::Char('K') => {
+                self.scroll_pane(self.detail_pane, -1);
+                true
+            }
+            KeyCode::Char('d') if ctrl => {
+                self.scroll_pane(self.detail_pane, self.page_step());
+                true
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.scroll_pane(self.detail_pane, -self.page_step());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn page_step(&self) -> i32 {
+        let rect = match self.detail_pane {
+            DetailPane::Input => self.rects.input,
+            DetailPane::Expected => self.rects.expected,
+            DetailPane::Output => self.rects.output,
+        };
+        PaneRects::view_h(rect).saturating_sub(1).max(1) as i32
+    }
+
+    pub fn scroll_pane(&mut self, pane: DetailPane, delta: i32) {
+        let i = pane.idx();
+        let view = match pane {
+            DetailPane::Input => PaneRects::view_h(self.rects.input),
+            DetailPane::Expected => PaneRects::view_h(self.rects.expected),
+            DetailPane::Output => PaneRects::view_h(self.rects.output),
+        };
+        let max = self.pane_lines[i].saturating_sub(view);
+        let next = (self.pane_scroll[i] as i32 + delta).clamp(0, max as i32);
+        self.pane_scroll[i] = next as u16;
+    }
+
+    fn reset_pane_scroll(&mut self) {
+        self.pane_scroll = [0; 3];
+        self.detail_pane = DetailPane::Input;
     }
 
     fn on_picker(&mut self, key: KeyEvent) {
@@ -231,8 +435,6 @@ impl App {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => self.persist(),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
-            KeyCode::Char('J') => self.detail_scroll = self.detail_scroll.saturating_add(1),
-            KeyCode::Char('K') => self.detail_scroll = self.detail_scroll.saturating_sub(1),
             _ => {}
         }
     }
@@ -389,7 +591,7 @@ impl App {
         let i = self.list_state.selected().unwrap_or(0) as i32;
         let next = (i + delta).rem_euclid(n as i32) as usize;
         self.list_state.select(Some(next));
-        self.detail_scroll = 0;
+        self.reset_pane_scroll();
     }
 
     fn run_selected(&mut self) {
